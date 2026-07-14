@@ -1,6 +1,6 @@
 # C3 Bolivia Data Explorer
 
-Streamlit data exploration app built from the local `c3databolivia` CSV files and modeled after the ExPdPy exploration template.
+Streamlit research-data workbench built from the local `c3databolivia` CSV files and modeled after the ExPdPy exploration template.
 
 ## Privacy
 
@@ -23,6 +23,8 @@ The app includes:
 - local dataset selection
 - department, province, year, range, and outlier filters
 - local data catalog for all CSV and GeoJSON files in `c3databolivia`
+- indicator-year sample chart with adjustable sample size
+- workbench-style Overview, Data Quality, Variable Explorer, and Analysis sections
 - overview, description, within/between, trends, group, composition, relationship, dynamics, and GDP per capita deep-dive views
 - panel exploration for GDP per capita, population, and night-time lights
 - downloadable filtered data, config JSON, and reproducible notebook starter
