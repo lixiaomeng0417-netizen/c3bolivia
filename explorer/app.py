@@ -803,6 +803,248 @@ def gini(values: pd.Series) -> float:
     return float((2 * np.arange(1, n + 1) @ x) / (n * x.sum()) - (n + 1) / n)
 
 
+def polynomial_terms(series: pd.Series, degree: int, prefix: str = "log_gdp_pc") -> pd.DataFrame:
+    x = pd.to_numeric(series, errors="coerce")
+    terms = pd.DataFrame(index=series.index)
+    for power in range(1, degree + 1):
+        name = prefix if power == 1 else f"{prefix}_{power}"
+        terms[name] = x ** power
+    return terms
+
+
+def fit_kuznets_model(data: pd.DataFrame, estimator: str, degree: int) -> dict:
+    y_col = "gini_regional"
+    x_col = "log_gdp_pc"
+    use = data.dropna(subset=[y_col, x_col, "dep", "year"]).copy()
+    if estimator == "Between":
+        use = use.groupby("dep", as_index=False)[[y_col, x_col]].mean()
+
+    x_terms = polynomial_terms(use[x_col], degree)
+    design = x_terms.copy()
+    if estimator == "Within two-way FE":
+        dep_dummies = pd.get_dummies(use["dep"], prefix="dep", drop_first=True, dtype=float)
+        year_dummies = pd.get_dummies(use["year"].astype(int), prefix="year", drop_first=True, dtype=float)
+        design = pd.concat([design, dep_dummies, year_dummies], axis=1)
+        include_intercept = True
+    else:
+        include_intercept = True
+
+    if include_intercept:
+        design.insert(0, "Intercept", 1.0)
+
+    X = design.to_numpy(dtype=float)
+    y = use[y_col].to_numpy(dtype=float)
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    fitted = X @ beta
+    ss_res = float(np.sum((y - fitted) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = np.nan if np.isclose(ss_tot, 0) else 1 - ss_res / ss_tot
+
+    coefficients = pd.Series(beta, index=design.columns)
+    poly_names = list(x_terms.columns)
+    return {
+        "estimator": estimator,
+        "data": use,
+        "coefficients": coefficients,
+        "poly_names": poly_names,
+        "n_obs": len(use),
+        "n_units": use["dep"].nunique() if "dep" in use.columns else len(use),
+        "r2": r2,
+    }
+
+
+def kuznets_turning_points(model: dict, x_min: float, x_max: float) -> pd.DataFrame:
+    coefs = model["coefficients"]
+    names = model["poly_names"]
+    b1 = float(coefs.get(names[0], 0.0)) if names else 0.0
+    b2 = float(coefs.get(names[1], 0.0)) if len(names) >= 2 else 0.0
+    b3 = float(coefs.get(names[2], 0.0)) if len(names) >= 3 else 0.0
+    roots = []
+    if len(names) == 2 and not np.isclose(b2, 0):
+        roots = [-b1 / (2 * b2)]
+    elif len(names) >= 3:
+        roots = [r.real for r in np.roots([3 * b3, 2 * b2, b1]) if np.isclose(r.imag, 0)]
+
+    rows = []
+    for root in roots:
+        if x_min <= root <= x_max:
+            second = 2 * b2 + 6 * b3 * root
+            rows.append(
+                {
+                    "estimator": model["estimator"],
+                    "log_gdp_pc": root,
+                    "gdp_pc": float(np.exp(root)),
+                    "type": "Peak" if second < 0 else "Trough",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def predict_kuznets_curve(model: dict, x_grid: np.ndarray) -> pd.DataFrame:
+    coefs = model["coefficients"]
+    names = model["poly_names"]
+    component = np.zeros_like(x_grid, dtype=float)
+    for power, name in enumerate(names, start=1):
+        component += float(coefs.get(name, 0.0)) * (x_grid ** power)
+
+    if model["estimator"] == "Within two-way FE":
+        sample_x = model["data"]["log_gdp_pc"]
+        sample_component = np.zeros(len(sample_x), dtype=float)
+        for power, name in enumerate(names, start=1):
+            sample_component += float(coefs.get(name, 0.0)) * (sample_x.to_numpy(dtype=float) ** power)
+        y_hat = model["data"]["gini_regional"].mean() + component - sample_component.mean()
+    else:
+        y_hat = float(coefs.get("Intercept", 0.0)) + component
+
+    return pd.DataFrame(
+        {
+            "log_gdp_pc": x_grid,
+            "gdp_pc": np.exp(x_grid),
+            "fitted_gini": y_hat,
+            "estimator": model["estimator"],
+        }
+    )
+
+
+def build_kuznets_wave_panel(gdp: pd.DataFrame, min_provinces: int) -> pd.DataFrame:
+    use = gdp.copy()
+    use["gdppc"] = pd.to_numeric(use["gdppc"], errors="coerce")
+    use = use.dropna(subset=["dep", "year", "prov_id", "gdppc"])
+    use = use[use["gdppc"] > 0]
+    panel = (
+        use.groupby(["dep", "year"])
+        .agg(
+            gini_regional=("gdppc", gini),
+            mean_gdp_pc=("gdppc", "mean"),
+            median_gdp_pc=("gdppc", "median"),
+            sd_log_gdp_pc=("gdppc", lambda s: np.log(s).std(ddof=0)),
+            provinces=("prov_id", "nunique"),
+        )
+        .reset_index()
+    )
+    panel = panel[panel["provinces"] >= min_provinces].copy()
+    panel["log_gdp_pc"] = np.log(panel["mean_gdp_pc"])
+    panel["log_gdp_pc_2"] = panel["log_gdp_pc"] ** 2
+    panel["log_gdp_pc_3"] = panel["log_gdp_pc"] ** 3
+    return panel.dropna(subset=["gini_regional", "log_gdp_pc"])
+
+
+def kuznets_waves():
+    st.header("Kuznets-Waves Curve")
+    st.markdown(
+        "<p class='section-caption'>Modeled after the expdpy Kuznets workflow: regional inequality is regressed on a polynomial in log GDP per capita under pooled, between, and two-way fixed-effect specifications.</p>",
+        unsafe_allow_html=True,
+    )
+    gdp = load_gdp_panel()
+    if gdp.empty:
+        st.info("GDP per capita files were not found in the local c3databolivia folder.")
+        return
+
+    if st.session_state.get("filter_dep") and "dep" in gdp.columns:
+        gdp = gdp[gdp["dep"].isin(st.session_state["filter_dep"])]
+
+    c1, c2, c3 = st.columns(3)
+    years = sorted(gdp["year"].dropna().astype(int).unique())
+    start, end = c1.select_slider("Kuznets period", options=years, value=(years[0], years[-1]))
+    degree = c2.selectbox("Polynomial degree", [3, 2], format_func=lambda d: "Cubic / N-shaped wave" if d == 3 else "Quadratic / inverted-U")
+    min_provinces = c3.slider("Minimum provinces per department-year", 2, 8, 3)
+
+    gdp = gdp[(gdp["year"] >= start) & (gdp["year"] <= end)].copy()
+    panel = build_kuznets_wave_panel(gdp, min_provinces)
+    if len(panel) < degree + 5 or panel["dep"].nunique() < 2:
+        st.warning("Not enough department-year observations for a stable Kuznets-waves estimate after filtering.")
+        return
+
+    estimators = st.multiselect(
+        "Estimators",
+        ["Pooled OLS", "Between", "Within two-way FE"],
+        default=["Pooled OLS", "Between", "Within two-way FE"],
+    )
+    models = [fit_kuznets_model(panel, estimator, degree) for estimator in estimators]
+    x_grid = np.linspace(panel["log_gdp_pc"].min(), panel["log_gdp_pc"].max(), 160)
+    curves = pd.concat([predict_kuznets_curve(model, x_grid) for model in models], ignore_index=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Department-years", f"{len(panel):,}")
+    c2.metric("Departments", f"{panel['dep'].nunique():,}")
+    c3.metric("Period", f"{int(panel['year'].min())}-{int(panel['year'].max())}")
+    c4.metric("Median regional Gini", f"{panel['gini_regional'].median():.3f}")
+
+    fig = go.Figure()
+    for dep, group in panel.groupby("dep"):
+        fig.add_trace(
+            go.Scatter(
+                x=group["log_gdp_pc"],
+                y=group["gini_regional"],
+                mode="markers",
+                name=dep,
+                marker=dict(size=8, opacity=0.58),
+                hovertemplate="dep=%{text}<br>year=%{customdata[0]}<br>Gini=%{y:.3f}<br>log GDPpc=%{x:.2f}<extra></extra>",
+                text=[dep] * len(group),
+                customdata=group[["year"]].to_numpy(),
+                legendgroup="departments",
+                showlegend=False,
+            )
+        )
+    palette = {"Pooled OLS": "#2f6f73", "Between": "#8a5a44", "Within two-way FE": "#8b3a62"}
+    for estimator, curve in curves.groupby("estimator"):
+        fig.add_trace(
+            go.Scatter(
+                x=curve["log_gdp_pc"],
+                y=curve["fitted_gini"],
+                mode="lines",
+                name=estimator,
+                line=dict(width=3, color=palette.get(estimator)),
+                hovertemplate=f"{estimator}<br>Gini=%{{y:.3f}}<br>log GDPpc=%{{x:.2f}}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title="Kuznets-waves: regional GDPpc inequality vs development",
+        xaxis_title="log(mean GDP per capita), department-year",
+        yaxis_title="Within-department province GDPpc Gini",
+        legend_title="Estimator",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    coef_rows = []
+    turning_rows = []
+    for model in models:
+        coefs = model["coefficients"]
+        for name in ["Intercept"] + model["poly_names"]:
+            if name in coefs.index:
+                coef_rows.append({"estimator": model["estimator"], "term": name, "coefficient": coefs[name]})
+        turning = kuznets_turning_points(model, panel["log_gdp_pc"].min(), panel["log_gdp_pc"].max())
+        if not turning.empty:
+            turning_rows.append(turning)
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Model Summary")
+        summary = pd.DataFrame(
+            [
+                {
+                    "estimator": model["estimator"],
+                    "observations": model["n_obs"],
+                    "departments": model["n_units"],
+                    "r2": model["r2"],
+                }
+                for model in models
+            ]
+        )
+        st.dataframe(summary, width="stretch", hide_index=True)
+    with right:
+        st.subheader("Implied Turning Points")
+        if turning_rows:
+            st.dataframe(pd.concat(turning_rows, ignore_index=True), width="stretch", hide_index=True)
+        else:
+            st.info("No peak or trough falls inside the observed log GDPpc range.")
+
+    with st.expander("Coefficient table and constructed Kuznets panel"):
+        st.dataframe(pd.DataFrame(coef_rows), width="stretch", hide_index=True)
+        st.dataframe(panel.sort_values(["dep", "year"]), width="stretch", hide_index=True)
+        download_frame(panel, "Download Kuznets department-year panel", "c3bolivia_kuznets_waves_panel.csv")
+
+
 def gdp_deep_dive():
     st.header("GDP Per Capita Deep Dive")
     gdp = load_gdp_panel()
@@ -1054,6 +1296,7 @@ analysis_page = st.selectbox(
         "Composition",
         "Relationships",
         "Dynamics",
+        "Kuznets-waves curve",
         "GDP per capita deep dive",
     ],
 )
@@ -1074,5 +1317,7 @@ elif analysis_page == "Relationships":
     relationships(df)
 elif analysis_page == "Dynamics":
     dynamics(df, panel)
+elif analysis_page == "Kuznets-waves curve":
+    kuznets_waves()
 elif analysis_page == "GDP per capita deep dive":
     gdp_deep_dive()
