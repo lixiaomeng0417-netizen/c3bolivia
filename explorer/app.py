@@ -812,19 +812,24 @@ def polynomial_terms(series: pd.Series, degree: int, prefix: str = "log_gdp_pc")
     return terms
 
 
-def fit_kuznets_model(data: pd.DataFrame, estimator: str, degree: int) -> dict:
-    y_col = "gini_regional"
-    x_col = "log_gdp_pc"
-    use = data.dropna(subset=[y_col, x_col, "dep", "year"]).copy()
+def fit_kuznets_model(
+    data: pd.DataFrame,
+    estimator: str,
+    degree: int,
+    y_col: str = "gini_regional",
+    x_col: str = "log_gdp_pc",
+    unit_col: str = "dep",
+) -> dict:
+    use = data.dropna(subset=[y_col, x_col, unit_col, "year"]).copy()
     if estimator == "Between":
-        use = use.groupby("dep", as_index=False)[[y_col, x_col]].mean()
+        use = use.groupby(unit_col, as_index=False)[[y_col, x_col]].mean()
 
     x_terms = polynomial_terms(use[x_col], degree)
     design = x_terms.copy()
     if estimator == "Within two-way FE":
-        dep_dummies = pd.get_dummies(use["dep"], prefix="dep", drop_first=True, dtype=float)
+        unit_dummies = pd.get_dummies(use[unit_col], prefix=unit_col, drop_first=True, dtype=float)
         year_dummies = pd.get_dummies(use["year"].astype(int), prefix="year", drop_first=True, dtype=float)
-        design = pd.concat([design, dep_dummies, year_dummies], axis=1)
+        design = pd.concat([design, unit_dummies, year_dummies], axis=1)
         include_intercept = True
     else:
         include_intercept = True
@@ -847,8 +852,11 @@ def fit_kuznets_model(data: pd.DataFrame, estimator: str, degree: int) -> dict:
         "data": use,
         "coefficients": coefficients,
         "poly_names": poly_names,
+        "y_col": y_col,
+        "x_col": x_col,
+        "unit_col": unit_col,
         "n_obs": len(use),
-        "n_units": use["dep"].nunique() if "dep" in use.columns else len(use),
+        "n_units": use[unit_col].nunique() if unit_col in use.columns else len(use),
         "r2": r2,
     }
 
@@ -888,11 +896,11 @@ def predict_kuznets_curve(model: dict, x_grid: np.ndarray) -> pd.DataFrame:
         component += float(coefs.get(name, 0.0)) * (x_grid ** power)
 
     if model["estimator"] == "Within two-way FE":
-        sample_x = model["data"]["log_gdp_pc"]
+        sample_x = model["data"][model["x_col"]]
         sample_component = np.zeros(len(sample_x), dtype=float)
         for power, name in enumerate(names, start=1):
             sample_component += float(coefs.get(name, 0.0)) * (sample_x.to_numpy(dtype=float) ** power)
-        y_hat = model["data"]["gini_regional"].mean() + component - sample_component.mean()
+        y_hat = model["data"][model["y_col"]].mean() + component - sample_component.mean()
     else:
         y_hat = float(coefs.get("Intercept", 0.0)) + component
 
@@ -927,6 +935,71 @@ def build_kuznets_wave_panel(gdp: pd.DataFrame, min_provinces: int) -> pd.DataFr
     panel["log_gdp_pc_2"] = panel["log_gdp_pc"] ** 2
     panel["log_gdp_pc_3"] = panel["log_gdp_pc"] ** 3
     return panel.dropna(subset=["gini_regional", "log_gdp_pc"])
+
+
+def build_province_kuznets_panel(gdp: pd.DataFrame) -> pd.DataFrame:
+    use = gdp.copy()
+    use["gdppc"] = pd.to_numeric(use["gdppc"], errors="coerce")
+    use = use.dropna(subset=["prov_id", "prov", "dep", "year", "gdppc"])
+    use = use[use["gdppc"] > 0].copy()
+    use["log_gdp_pc"] = np.log(use["gdppc"])
+    dep_year_mean = use.groupby(["dep", "year"])["log_gdp_pc"].transform("mean")
+    use["province_gap"] = (use["log_gdp_pc"] - dep_year_mean).abs()
+    use["signed_gap"] = use["log_gdp_pc"] - dep_year_mean
+    use["province_unit"] = use["prov_id"].astype(str)
+    use["province_name"] = use[province_label_column(use)] if province_label_column(use) in use.columns else use["prov"].astype(str)
+    return use.dropna(subset=["province_gap", "log_gdp_pc"])
+
+
+def plot_kuznets_fit(
+    data: pd.DataFrame,
+    models: list[dict],
+    x_col: str,
+    y_col: str,
+    color_col: str,
+    hover_cols: list[str],
+    title: str,
+    x_title: str,
+    y_title: str,
+    show_scatter_legend: bool = False,
+    hovertemplate: str | None = None,
+) -> go.Figure:
+    x_grid = np.linspace(data[x_col].min(), data[x_col].max(), 160)
+    curves = pd.concat([predict_kuznets_curve(model, x_grid) for model in models], ignore_index=True)
+    fig = go.Figure()
+    for group_name, group in data.groupby(color_col):
+        fig.add_trace(
+            go.Scatter(
+                x=group[x_col],
+                y=group[y_col],
+                mode="markers",
+                name=str(group_name),
+                marker=dict(size=7, opacity=0.48),
+                customdata=group[hover_cols].to_numpy() if hover_cols else None,
+                hovertemplate=hovertemplate or ("x=%{x:.2f}<br>y=%{y:.3f}<extra></extra>"),
+                legendgroup="points",
+                showlegend=show_scatter_legend,
+            )
+        )
+    palette = {"Pooled OLS": "#2f6f73", "Between": "#8a5a44", "Within two-way FE": "#8b3a62"}
+    for estimator, curve in curves.groupby("estimator"):
+        fig.add_trace(
+            go.Scatter(
+                x=curve["log_gdp_pc"],
+                y=curve["fitted_gini"],
+                mode="lines",
+                name=estimator,
+                line=dict(width=3, color=palette.get(estimator)),
+                hovertemplate=f"{estimator}<br>y=%{{y:.3f}}<br>x=%{{x:.2f}}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        legend_title="Estimator",
+    )
+    return fig
 
 
 def kuznets_waves():
@@ -1005,6 +1078,84 @@ def kuznets_waves():
         legend_title="Estimator",
     )
     st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Province-level spatial gap curve")
+    st.markdown(
+        "<p class='section-caption'>Each point is a province-year. The y-axis is the absolute log GDPpc gap between the province and its department-year mean, so this view asks whether richer provinces sit closer to, or farther from, their local department average.</p>",
+        unsafe_allow_html=True,
+    )
+    province_panel = build_province_kuznets_panel(gdp)
+    if len(province_panel) < degree + 5 or province_panel["province_unit"].nunique() < 2:
+        st.info("Not enough province-year observations for a province-level Kuznets curve after filtering.")
+    else:
+        province_models = [
+            fit_kuznets_model(
+                province_panel,
+                estimator,
+                degree,
+                y_col="province_gap",
+                x_col="log_gdp_pc",
+                unit_col="province_unit",
+            )
+            for estimator in estimators
+        ]
+        province_fig = plot_kuznets_fit(
+            province_panel,
+            province_models,
+            x_col="log_gdp_pc",
+            y_col="province_gap",
+            color_col="dep",
+            hover_cols=["province_name", "dep", "year", "gdppc", "signed_gap"],
+            title="Province-level Kuznets curve: GDPpc gap vs province development",
+            x_title="log(province GDP per capita), province-year",
+            y_title="Absolute log gap from department-year mean",
+            hovertemplate=(
+                "province=%{customdata[0]}<br>"
+                "dep=%{customdata[1]}<br>"
+                "year=%{customdata[2]}<br>"
+                "GDPpc=%{customdata[3]:,.0f}<br>"
+                "signed gap=%{customdata[4]:.3f}<br>"
+                "absolute gap=%{y:.3f}<br>"
+                "log GDPpc=%{x:.2f}<extra></extra>"
+            ),
+        )
+        st.plotly_chart(province_fig, width="stretch")
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Province-years", f"{len(province_panel):,}")
+        p2.metric("Provinces", f"{province_panel['province_unit'].nunique():,}")
+        p3.metric("Median absolute gap", f"{province_panel['province_gap'].median():.3f}")
+        p4.metric("90th pct. absolute gap", f"{province_panel['province_gap'].quantile(0.90):.3f}")
+
+        with st.expander("Province-level model summary and panel"):
+            province_summary = pd.DataFrame(
+                [
+                    {
+                        "estimator": model["estimator"],
+                        "observations": model["n_obs"],
+                        "provinces": model["n_units"],
+                        "r2": model["r2"],
+                    }
+                    for model in province_models
+                ]
+            )
+            st.dataframe(province_summary, width="stretch", hide_index=True)
+            st.dataframe(
+                province_panel[
+                    [
+                        "province_name",
+                        "dep",
+                        "year",
+                        "gdppc",
+                        "log_gdp_pc",
+                        "province_gap",
+                        "signed_gap",
+                    ]
+                ].sort_values(["province_name", "year"]),
+                width="stretch",
+                hide_index=True,
+            )
+            download_frame(province_panel, "Download province-level Kuznets panel", "c3bolivia_kuznets_province_panel.csv")
 
     coef_rows = []
     turning_rows = []
