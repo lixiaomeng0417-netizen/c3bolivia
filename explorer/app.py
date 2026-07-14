@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 from pathlib import Path
 
@@ -1002,6 +1003,293 @@ def plot_kuznets_fit(
     return fig
 
 
+def build_province_panel(gdp: pd.DataFrame) -> pd.DataFrame:
+    panel = gdp.copy()
+    panel["gdppc"] = pd.to_numeric(panel["gdppc"], errors="coerce")
+    panel = panel.dropna(subset=["prov_id", "prov", "dep", "year", "gdppc"])
+    panel = panel[panel["gdppc"] > 0].copy()
+    panel["year"] = panel["year"].astype(int)
+    panel["province_name"] = panel[province_label_column(panel)] if province_label_column(panel) in panel.columns else panel["prov"].astype(str)
+    panel["unit"] = panel["prov_id"].astype(str)
+    panel["log_gdp_pc"] = np.log(panel["gdppc"])
+    panel = panel.sort_values(["unit", "year"])
+    panel["lag_log_gdp_pc"] = panel.groupby("unit")["log_gdp_pc"].shift(1)
+    panel["growth_log_gdp_pc"] = panel.groupby("unit")["log_gdp_pc"].diff()
+    panel["dep_year_mean_log_gdp_pc"] = panel.groupby(["dep", "year"])["log_gdp_pc"].transform("mean")
+    panel["province_gap"] = (panel["log_gdp_pc"] - panel["dep_year_mean_log_gdp_pc"]).abs()
+    panel["signed_gap"] = panel["log_gdp_pc"] - panel["dep_year_mean_log_gdp_pc"]
+    return panel
+
+
+def design_matrix(df: pd.DataFrame, x_cols: list[str], fe_cols: list[str] | None = None, intercept: bool = True) -> tuple[pd.DataFrame, pd.Series]:
+    use_cols = x_cols + (fe_cols or [])
+    use = df.dropna(subset=use_cols).copy()
+    X = use[x_cols].astype(float).copy()
+    for fe in fe_cols or []:
+        dummies = pd.get_dummies(use[fe].astype(str), prefix=fe, drop_first=True, dtype=float)
+        X = pd.concat([X, dummies], axis=1)
+    if intercept:
+        X.insert(0, "Intercept", 1.0)
+    return X, use.index.to_series(index=use.index)
+
+
+def ols_table(df: pd.DataFrame, y_col: str, x_cols: list[str], fe_cols: list[str] | None = None, cluster_col: str | None = None) -> dict:
+    needed = [y_col] + x_cols + (fe_cols or []) + ([cluster_col] if cluster_col else [])
+    use = df.dropna(subset=needed).copy()
+    X, _ = design_matrix(use, x_cols, fe_cols)
+    y = use[y_col].astype(float)
+    X_np = X.to_numpy(dtype=float)
+    y_np = y.to_numpy(dtype=float)
+    beta, *_ = np.linalg.lstsq(X_np, y_np, rcond=None)
+    fitted = X_np @ beta
+    resid = y_np - fitted
+    n, k = X_np.shape
+    xtx_inv = np.linalg.pinv(X_np.T @ X_np)
+    if cluster_col and cluster_col in use.columns:
+        meat = np.zeros((k, k))
+        for _, idx in use.groupby(cluster_col).groups.items():
+            pos = use.index.get_indexer(idx)
+            Xg = X_np[pos, :]
+            eg = resid[pos]
+            score = Xg.T @ eg
+            meat += np.outer(score, score)
+        vcov = xtx_inv @ meat @ xtx_inv
+    else:
+        sigma2 = float((resid @ resid) / max(n - k, 1))
+        vcov = sigma2 * xtx_inv
+    se = np.sqrt(np.maximum(np.diag(vcov), 0))
+    out = pd.DataFrame({"term": X.columns, "coef": beta, "se": se})
+    out["t"] = out["coef"] / out["se"].replace(0, np.nan)
+    out["p_approx"] = 2 * (1 - 0.5 * (1 + np.vectorize(math.erf)(np.abs(out["t"]) / math.sqrt(2))))
+    ss_res = float(np.sum(resid**2))
+    ss_tot = float(np.sum((y_np - y_np.mean()) ** 2))
+    return {
+        "table": out,
+        "data": use,
+        "x_cols": x_cols,
+        "y_col": y_col,
+        "fe_cols": fe_cols or [],
+        "cluster_col": cluster_col,
+        "fitted": fitted,
+        "resid": resid,
+        "r2": np.nan if np.isclose(ss_tot, 0) else 1 - ss_res / ss_tot,
+        "n": n,
+        "k": k,
+    }
+
+
+def random_effects_table(df: pd.DataFrame, y_col: str, x_cols: list[str], unit_col: str = "unit", cluster_col: str | None = "unit") -> dict:
+    use = df.dropna(subset=[y_col, unit_col] + x_cols).copy()
+    pooled = ols_table(use, y_col, x_cols, cluster_col=cluster_col)
+    use["_pooled_resid"] = pooled["resid"]
+    tbar = use.groupby(unit_col).size().mean()
+    unit_mean_resid = use.groupby(unit_col)["_pooled_resid"].mean()
+    sigma_e2 = float(np.nanvar(use["_pooled_resid"] - use.groupby(unit_col)["_pooled_resid"].transform("mean")))
+    sigma_u2 = max(float(np.nanvar(unit_mean_resid) - sigma_e2 / max(tbar, 1)), 0.0)
+    theta = 1 - math.sqrt(sigma_e2 / (sigma_e2 + max(tbar, 1) * sigma_u2)) if sigma_e2 + tbar * sigma_u2 > 0 else 0.0
+    for col in [y_col] + x_cols:
+        use[f"_re_{col}"] = use[col] - theta * use.groupby(unit_col)[col].transform("mean")
+    result = ols_table(use, f"_re_{y_col}", [f"_re_{c}" for c in x_cols], cluster_col=cluster_col)
+    result["table"]["term"] = result["table"]["term"].str.replace("_re_", "", regex=False)
+    result["theta"] = theta
+    return result
+
+
+def correlated_random_effects_table(df: pd.DataFrame, y_col: str, x_cols: list[str], unit_col: str = "unit", cluster_col: str | None = "unit") -> dict:
+    use = df.dropna(subset=[y_col, unit_col] + x_cols).copy()
+    mean_cols = []
+    for col in x_cols:
+        mean_col = f"mean_{col}"
+        use[mean_col] = use.groupby(unit_col)[col].transform("mean")
+        mean_cols.append(mean_col)
+    return ols_table(use, y_col, x_cols + mean_cols, cluster_col=cluster_col)
+
+
+def hausman_one_term(fe_result: dict, re_result: dict, term: str) -> dict:
+    fe = fe_result["table"].set_index("term")
+    re = re_result["table"].set_index("term")
+    if term not in fe.index or term not in re.index:
+        return {"term": term, "statistic": np.nan, "p_approx": np.nan, "difference": np.nan}
+    diff = float(fe.loc[term, "coef"] - re.loc[term, "coef"])
+    var = float(fe.loc[term, "se"] ** 2 + re.loc[term, "se"] ** 2)
+    stat = diff**2 / var if var > 0 else np.nan
+    pval = math.erfc(math.sqrt(stat / 2)) if np.isfinite(stat) else np.nan
+    return {"term": term, "statistic": stat, "p_approx": pval, "difference": diff}
+
+
+def residualize(df: pd.DataFrame, col: str, controls: list[str], fe_cols: list[str]) -> pd.Series:
+    result = ols_table(df, col, controls, fe_cols=fe_cols) if controls or fe_cols else None
+    if result is None:
+        return df[col] - df[col].mean()
+    residuals = pd.Series(result["resid"], index=result["data"].index)
+    return residuals
+
+
+def cluster_bootstrap_coef(df: pd.DataFrame, y_col: str, x_cols: list[str], term: str, fe_cols: list[str], cluster_col: str, reps: int, seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    clusters = df[cluster_col].dropna().unique()
+    rows = []
+    for _ in range(reps):
+        picked = rng.choice(clusters, size=len(clusters), replace=True)
+        sample = pd.concat([df[df[cluster_col] == c] for c in picked], ignore_index=True)
+        try:
+            res = ols_table(sample, y_col, x_cols, fe_cols=fe_cols, cluster_col=cluster_col)
+            tab = res["table"].set_index("term")
+            rows.append(tab.loc[term, "coef"] if term in tab.index else np.nan)
+        except Exception:
+            rows.append(np.nan)
+    vals = pd.Series(rows, name="bootstrap_coef").dropna()
+    return pd.DataFrame({"estimate": vals})
+
+
+def beta_convergence_panel(panel: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
+    start_df = panel[panel["year"] == start][["unit", "province_name", "dep", "log_gdp_pc"]].rename(columns={"log_gdp_pc": "initial_log_gdp_pc"})
+    end_df = panel[panel["year"] == end][["unit", "log_gdp_pc"]].rename(columns={"log_gdp_pc": "end_log_gdp_pc"})
+    conv = start_df.merge(end_df, on="unit", how="inner")
+    years_elapsed = max(end - start, 1)
+    conv["annualized_growth"] = (conv["end_log_gdp_pc"] - conv["initial_log_gdp_pc"]) / years_elapsed
+    return conv.dropna()
+
+
+def event_study_panel(panel: pd.DataFrame, threshold_quantile: float, window: int) -> pd.DataFrame:
+    use = panel.copy()
+    thresholds = use.groupby("year")["log_gdp_pc"].transform(lambda s: s.quantile(threshold_quantile))
+    use["treated_now"] = use["log_gdp_pc"] >= thresholds
+    cohorts = use[use["treated_now"]].groupby("unit")["year"].min().rename("cohort")
+    use = use.merge(cohorts, on="unit", how="left")
+    use = use.dropna(subset=["cohort"]).copy()
+    use["event_time"] = use["year"] - use["cohort"].astype(int)
+    use = use[(use["event_time"] >= -window) & (use["event_time"] <= window)].copy()
+    baseline = use[use["event_time"] == -1].groupby("unit")["log_gdp_pc"].mean().rename("baseline")
+    use = use.merge(baseline, on="unit", how="left")
+    use["event_outcome"] = use["log_gdp_pc"] - use["baseline"]
+    return use.dropna(subset=["event_outcome"])
+
+
+def province_econometrics_lab():
+    st.header("Province Econometrics Lab")
+    st.markdown(
+        "<p class='section-caption'>Province-year GDPpc panel methods adapted from the expdpy Analyze workflow: FE/RE/CRE, FWL, Hausman, robust inference, event-study/DiD, convergence, and Kuznets waves.</p>",
+        unsafe_allow_html=True,
+    )
+    gdp = load_gdp_panel()
+    if gdp.empty:
+        st.info("GDP per capita files were not found in the local c3databolivia folder.")
+        return
+    panel = build_province_panel(gdp)
+    if st.session_state.get("filter_dep") and "dep" in panel.columns:
+        panel = panel[panel["dep"].isin(st.session_state["filter_dep"])]
+    if st.session_state.get("filter_prov"):
+        panel = panel[panel["province_name"].isin(st.session_state["filter_prov"])]
+
+    years = sorted(panel["year"].dropna().astype(int).unique())
+    c1, c2, c3 = st.columns(3)
+    start, end = c1.select_slider("Analysis period", options=years, value=(years[0], years[-1]))
+    y_col = c2.selectbox("Outcome", ["growth_log_gdp_pc", "log_gdp_pc", "province_gap"], format_func=friendly)
+    main_x = c3.selectbox("Main regressor", ["lag_log_gdp_pc", "log_gdp_pc", "province_gap"], index=0, format_func=friendly)
+    work = panel[(panel["year"] >= start) & (panel["year"] <= end)].copy()
+    x_cols = [main_x]
+    if y_col == main_x:
+        x_cols = ["lag_log_gdp_pc"] if y_col != "lag_log_gdp_pc" else ["province_gap"]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Province-years", f"{len(work):,}")
+    k2.metric("Provinces", f"{work['unit'].nunique():,}")
+    k3.metric("Departments", f"{work['dep'].nunique():,}")
+    k4.metric("Period", f"{start}-{end}")
+
+    st.subheader("Panel estimators: fixed, random, correlated random effects")
+    pooled = ols_table(work, y_col, x_cols, cluster_col="unit")
+    fe = ols_table(work, y_col, x_cols, fe_cols=["unit", "year"], cluster_col="unit")
+    re = random_effects_table(work, y_col, x_cols, unit_col="unit", cluster_col="unit")
+    cre = correlated_random_effects_table(work, y_col, x_cols, unit_col="unit", cluster_col="unit")
+    model_tables = []
+    for label, result in [("Pooled OLS", pooled), ("Fixed effects", fe), ("Random effects", re), ("Correlated random effects", cre)]:
+        tab = result["table"][result["table"]["term"].isin(["Intercept"] + x_cols + [f"mean_{c}" for c in x_cols])].copy()
+        tab.insert(0, "model", label)
+        tab["r2"] = result["r2"]
+        tab["n"] = result["n"]
+        model_tables.append(tab)
+    st.dataframe(pd.concat(model_tables, ignore_index=True), width="stretch", hide_index=True)
+    st.caption(f"Random-effects theta: {re.get('theta', np.nan):.3f}. Standard errors are province-clustered approximations.")
+
+    st.subheader("Hausman test and FWL plot")
+    left, right = st.columns(2)
+    with left:
+        haus = hausman_one_term(fe, re, x_cols[0])
+        st.dataframe(pd.DataFrame([haus]), width="stretch", hide_index=True)
+        st.caption("Small p-values suggest RE is less credible relative to FE for the selected coefficient.")
+    with right:
+        fwl_df = work.dropna(subset=[y_col] + x_cols).copy()
+        controls = [c for c in x_cols if c != x_cols[0]]
+        fwl_df["resid_y"] = residualize(fwl_df, y_col, controls, ["unit", "year"])
+        fwl_df["resid_x"] = residualize(fwl_df, x_cols[0], controls, ["unit", "year"])
+        fwl_slope = ols_table(fwl_df, "resid_y", ["resid_x"], cluster_col="unit")
+        fig = px.scatter(fwl_df, x="resid_x", y="resid_y", color="dep", hover_name="province_name", title=f"FWL residual plot for {x_cols[0]}")
+        xline = np.linspace(fwl_df["resid_x"].min(), fwl_df["resid_x"].max(), 100)
+        slope = fwl_slope["table"].set_index("term").loc["resid_x", "coef"]
+        fig.add_trace(go.Scatter(x=xline, y=slope * xline, mode="lines", name="FWL slope", line=dict(color="#222", width=3)))
+        st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Robust inference")
+    reps = st.slider("Cluster bootstrap repetitions", 50, 500, 150, step=50)
+    boot = cluster_bootstrap_coef(work.dropna(subset=[y_col] + x_cols), y_col, x_cols, x_cols[0], ["unit", "year"], "unit", reps, seed=0)
+    boot_ci = boot["estimate"].quantile([0.025, 0.5, 0.975]).reset_index()
+    boot_ci.columns = ["quantile", "coefficient"]
+    c1, c2 = st.columns(2)
+    with c1:
+        st.dataframe(boot_ci, width="stretch", hide_index=True)
+    with c2:
+        st.plotly_chart(px.histogram(boot, x="estimate", nbins=35, title=f"Cluster bootstrap: {x_cols[0]}"), width="stretch")
+
+    st.subheader("Event-study / DiD style view")
+    e1, e2 = st.columns(2)
+    threshold_q = e1.slider("Treatment: first entry above yearly GDPpc quantile", 0.50, 0.95, 0.75, step=0.05)
+    window = e2.slider("Event window", 2, 10, 5)
+    es = event_study_panel(work, threshold_q, window)
+    if es.empty:
+        st.info("No event-study sample under the current settings.")
+    else:
+        event = es.groupby("event_time", as_index=False)["event_outcome"].agg(mean="mean", se=lambda s: s.std(ddof=1) / math.sqrt(len(s)))
+        event["lo"] = event["mean"] - 1.96 * event["se"]
+        event["hi"] = event["mean"] + 1.96 * event["se"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=event["event_time"], y=event["hi"], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=event["event_time"], y=event["lo"], fill="tonexty", line=dict(width=0), name="95% CI"))
+        fig.add_trace(go.Scatter(x=event["event_time"], y=event["mean"], mode="lines+markers", name="Mean change"))
+        fig.add_vline(x=-0.5, line_dash="dash")
+        fig.update_layout(title="Event-study: log GDPpc relative to t=-1", xaxis_title="Event time", yaxis_title="Change from pre-event baseline")
+        st.plotly_chart(fig, width="stretch")
+
+    st.subheader("β / σ / club convergence")
+    conv = beta_convergence_panel(work, start, end)
+    c1, c2 = st.columns(2)
+    with c1:
+        beta_res = ols_table(conv, "annualized_growth", ["initial_log_gdp_pc"], cluster_col=None)
+        fig = px.scatter(conv, x="initial_log_gdp_pc", y="annualized_growth", color="dep", hover_name="province_name", title="β-convergence")
+        slope = beta_res["table"].set_index("term").loc["initial_log_gdp_pc", "coef"]
+        intercept = beta_res["table"].set_index("term").loc["Intercept", "coef"]
+        xs = np.linspace(conv["initial_log_gdp_pc"].min(), conv["initial_log_gdp_pc"].max(), 100)
+        fig.add_trace(go.Scatter(x=xs, y=intercept + slope * xs, mode="lines", name="OLS fit", line=dict(color="#222", width=3)))
+        st.plotly_chart(fig, width="stretch")
+    with c2:
+        sigma = work.groupby("year")["log_gdp_pc"].agg(std="std", mean="mean", gini=gini).reset_index()
+        sigma["cv"] = sigma["std"] / sigma["mean"].abs()
+        st.plotly_chart(px.line(sigma, x="year", y=["std", "gini", "cv"], markers=True, title="σ-convergence diagnostics"), width="stretch")
+    club = conv.copy()
+    club["club"] = pd.qcut(club["initial_log_gdp_pc"], q=min(4, max(2, club["initial_log_gdp_pc"].nunique())), labels=False, duplicates="drop")
+    club_summary = club.groupby("club", as_index=False).agg(
+        provinces=("unit", "count"),
+        initial_mean=("initial_log_gdp_pc", "mean"),
+        growth_mean=("annualized_growth", "mean"),
+    )
+    st.dataframe(club_summary, width="stretch", hide_index=True)
+
+    with st.expander("Province econometrics panel"):
+        st.dataframe(work.sort_values(["province_name", "year"]), width="stretch", hide_index=True)
+        download_frame(work, "Download province econometrics panel", "c3bolivia_province_econometrics_panel.csv")
+
+
 def kuznets_waves():
     st.header("Kuznets-Waves Curve")
     st.markdown(
@@ -1447,6 +1735,7 @@ analysis_page = st.selectbox(
         "Composition",
         "Relationships",
         "Dynamics",
+        "Province econometrics lab",
         "Kuznets-waves curve",
         "GDP per capita deep dive",
     ],
@@ -1468,6 +1757,8 @@ elif analysis_page == "Relationships":
     relationships(df)
 elif analysis_page == "Dynamics":
     dynamics(df, panel)
+elif analysis_page == "Province econometrics lab":
+    province_econometrics_lab()
 elif analysis_page == "Kuznets-waves curve":
     kuznets_waves()
 elif analysis_page == "GDP per capita deep dive":
