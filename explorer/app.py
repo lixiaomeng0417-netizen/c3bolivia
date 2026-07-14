@@ -43,16 +43,36 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.7rem; padding-bottom: 3rem;}
-    [data-testid="stSidebar"] {border-right: 1px solid #e7e2d8;}
-    h1, h2, h3 {letter-spacing: 0;}
+    .block-container {padding-top: 1.5rem; padding-bottom: 3.5rem; max-width: 1320px;}
+    [data-testid="stSidebar"] {border-right: 1px solid #e6e8eb; background: #fbfbf8;}
+    h1, h2, h3 {letter-spacing: 0; color: #1f2933;}
+    h1 {font-size: 2rem;}
+    h2 {font-size: 1.45rem; margin-top: 1.8rem;}
+    h3 {font-size: 1.08rem;}
     div[data-testid="stMetric"] {
-        border: 1px solid #e5e2dc;
+        border: 1px solid #e1e5ea;
         border-radius: 8px;
-        padding: 0.65rem 0.8rem;
-        background: #fffefa;
+        padding: 0.75rem 0.85rem;
+        background: #ffffff;
+        box-shadow: 0 1px 2px rgba(31, 41, 51, 0.04);
     }
-    .small-note {color: #5e635f; font-size: 0.92rem;}
+    .section-caption {color: #5d6975; font-size: 0.94rem; margin-top: -0.4rem; margin-bottom: 1rem;}
+    .dashboard-rule {border-top: 1px solid #e6e8eb; margin: 1.6rem 0 1.2rem;}
+    .summary-box {
+        border-left: 4px solid #567568;
+        background: #f6f8f5;
+        padding: 0.85rem 1rem;
+        border-radius: 6px;
+        color: #263238;
+        margin: 0.5rem 0 1.2rem;
+    }
+    .warning-note {
+        border-left: 4px solid #b7791f;
+        background: #fff8e8;
+        padding: 0.7rem 0.9rem;
+        border-radius: 6px;
+        color: #3f3422;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -77,12 +97,12 @@ def load_dataset(filename: str) -> pd.DataFrame:
     df = load_csv(dataset_path(filename))
     regions = load_region_names()
     if "prov_id" not in df.columns or regions.empty:
-        return df
+        return add_province_labels(df)
 
     add_cols = [c for c in ID_COLS + ["capital", "n_mun"] if c in regions.columns and c not in df.columns]
     if not add_cols:
-        return df
-    return df.merge(regions[["prov_id"] + add_cols], on="prov_id", how="left")
+        return add_province_labels(df)
+    return add_province_labels(df.merge(regions[["prov_id"] + add_cols], on="prov_id", how="left"))
 
 
 def dataset_path(filename: str) -> Path:
@@ -93,8 +113,47 @@ def geojson_path() -> Path:
     return DATA_DIR / GEOJSON_FILE
 
 
+def add_province_labels(df: pd.DataFrame) -> pd.DataFrame:
+    if "prov_label" in df.columns or "prov" not in df.columns:
+        return df
+    out = df.copy()
+    if "dep_prov" in out.columns:
+        out["prov_label"] = out["dep_prov"]
+        return out
+    if "dep" not in out.columns:
+        out["prov_label"] = out["prov"]
+        return out
+    unique_pairs = out[["prov", "dep"]].drop_duplicates()
+    repeated = unique_pairs["prov"].value_counts()
+    repeated_names = set(repeated[repeated > 1].index)
+    out["prov_label"] = np.where(
+        out["prov"].isin(repeated_names),
+        out["dep"].astype(str) + "-" + out["prov"].astype(str),
+        out["prov"].astype(str),
+    )
+    return out
+
+
+def province_label_column(df: pd.DataFrame) -> str:
+    if "prov_label" in df.columns:
+        return "prov_label"
+    if "dep_prov" in df.columns:
+        return "dep_prov"
+    if "prov" in df.columns:
+        return "prov"
+    return "prov_id"
+
+
+def unique_existing(columns: list[str], df: pd.DataFrame) -> list[str]:
+    return list(dict.fromkeys([c for c in columns if c in df.columns]))
+
+
 def numeric_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return [
+        c
+        for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
+    ]
 
 
 def category_cols(df: pd.DataFrame) -> list[str]:
@@ -143,7 +202,7 @@ def infer_years(df: pd.DataFrame) -> list[int]:
 def make_panel(df: pd.DataFrame) -> pd.DataFrame | None:
     if {"year", "gdppc"}.issubset(df.columns):
         keep = [c for c in ["prov_id", "prov", "dep", "dep_id", "year", "gdppc", "log_gdppc"] if c in df.columns]
-        return df[keep].copy()
+        return add_province_labels(df[keep].copy())
 
     gdppc_cols = [c for c in df.columns if re.fullmatch(r"gdppc\d{4}", c)]
     if gdppc_cols:
@@ -151,7 +210,7 @@ def make_panel(df: pd.DataFrame) -> pd.DataFrame | None:
         long_df = df.melt(id_vars=id_cols, value_vars=gdppc_cols, var_name="indicator", value_name="gdppc")
         long_df["year"] = long_df["indicator"].str.extract(r"(\d{4})").astype(int)
         long_df["log_gdppc"] = np.log(long_df["gdppc"].where(long_df["gdppc"] > 0))
-        return long_df.drop(columns=["indicator"])
+        return add_province_labels(long_df.drop(columns=["indicator"]))
 
     return make_yearly_panel(df)
 
@@ -174,7 +233,7 @@ def make_yearly_panel(df: pd.DataFrame) -> pd.DataFrame | None:
         frames.append(melted.drop(columns=["indicator"]))
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True)
+    return add_province_labels(pd.concat(frames, ignore_index=True))
 
 
 def panel_value_options(panel: pd.DataFrame) -> list[str]:
@@ -191,15 +250,55 @@ def filter_panel_metric(panel: pd.DataFrame, key: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_indicator_panel() -> pd.DataFrame:
+    frames = []
+
+    gdp_path = dataset_path("gdp_perCapita_long.csv")
+    if gdp_path.exists():
+        gdp = pd.read_csv(gdp_path)
+        gdp = add_province_labels(gdp)
+        gdp = gdp.rename(columns={"gdppc": "value"})
+        gdp["indicator"] = "GDP per capita"
+        frames.append(gdp[[c for c in ["prov_id", "prov", "prov_label", "dep", "dep_id", "year", "indicator", "value"] if c in gdp.columns]])
+
+    for filename, patterns in {
+        "pop.csv": [(r"pop(\d{4})", "Population")],
+        "ln_NTLpc.csv": [
+            (r"ln_NTLpc(\d{4})", "Night-time lights per capita"),
+            (r"ln_t400NTLpc(\d{4})", "Trimmed night-time lights per capita"),
+        ],
+    }.items():
+        path = dataset_path(filename)
+        if not path.exists():
+            continue
+        source = load_dataset(filename)
+        id_cols = [c for c in ["prov_id", "prov", "prov_label", "dep", "dep_id"] if c in source.columns]
+        for pattern, indicator in patterns:
+            value_cols = [c for c in source.columns if re.fullmatch(pattern, c)]
+            if not value_cols:
+                continue
+            long_df = source.melt(id_vars=id_cols, value_vars=value_cols, var_name="source_column", value_name="value")
+            long_df["year"] = long_df["source_column"].str.extract(r"(\d{4})").astype(int)
+            long_df["indicator"] = indicator
+            frames.append(long_df[id_cols + ["year", "indicator", "value"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["prov_id", "prov", "prov_label", "dep", "dep_id", "year", "indicator", "value"])
+    panel = pd.concat(frames, ignore_index=True)
+    panel["value"] = pd.to_numeric(panel["value"], errors="coerce")
+    return add_province_labels(panel.dropna(subset=["value", "year", "indicator"]))
+
+
+@st.cache_data(show_spinner=False)
 def load_gdp_panel() -> pd.DataFrame:
     path = dataset_path("gdp_perCapita_long.csv")
     if path.exists():
-        return pd.read_csv(path)
+        return add_province_labels(pd.read_csv(path))
     wide_path = dataset_path("gdp_perCapita_1990_2024.csv")
     if not wide_path.exists():
         return pd.DataFrame()
     panel = make_panel(pd.read_csv(wide_path))
-    return panel if panel is not None else pd.DataFrame()
+    return add_province_labels(panel) if panel is not None else pd.DataFrame()
 
 
 def winsorize(df: pd.DataFrame, cols: list[str], lower: float, upper: float) -> pd.DataFrame:
@@ -215,8 +314,10 @@ def apply_filters(df: pd.DataFrame, range_col: str | None, range_values, outlier
     filtered = df.copy()
     if "dep" in filtered.columns and st.session_state.get("filter_dep"):
         filtered = filtered[filtered["dep"].isin(st.session_state["filter_dep"])]
-    if "prov" in filtered.columns and st.session_state.get("filter_prov"):
-        filtered = filtered[filtered["prov"].isin(st.session_state["filter_prov"])]
+    if st.session_state.get("filter_prov"):
+        label_col = province_label_column(filtered)
+        if label_col in filtered.columns:
+            filtered = filtered[filtered[label_col].isin(st.session_state["filter_prov"])]
     if "year" in filtered.columns and st.session_state.get("year_range"):
         lo, hi = st.session_state["year_range"]
         filtered = filtered[(filtered["year"] >= lo) & (filtered["year"] <= hi)]
@@ -246,7 +347,7 @@ def pca_2d(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     mat = (mat - mat.mean()) / mat.std(ddof=0).replace(0, 1)
     u, s, _ = np.linalg.svd(mat.to_numpy(), full_matrices=False)
     coords = u[:, :2] * s[:2]
-    out = df[[c for c in ["prov", "dep", "imds"] if c in df.columns]].copy()
+    out = df[[c for c in ["prov", "prov_label", "dep", "imds"] if c in df.columns]].copy()
     out["PC1"] = coords[:, 0]
     out["PC2"] = coords[:, 1]
     return out
@@ -257,6 +358,73 @@ def metric_row(df: pd.DataFrame):
     c1.metric("Rows kept", f"{len(df):,}")
     c2.metric("Columns", f"{df.shape[1]:,}")
     c3.metric("Numeric variables", f"{len(numeric_cols(df)):,}")
+
+
+def panel_balance_status(panel: pd.DataFrame | None) -> tuple[str, pd.DataFrame | None]:
+    if panel is None or "year" not in panel.columns:
+        return "Not panel", None
+    unit = "prov_id" if "prov_id" in panel.columns else panel.columns[0]
+    counts = panel.groupby("year")[unit].nunique().reset_index(name="observed_units")
+    if counts.empty:
+        return "No panel rows", counts
+    return ("Balanced" if counts["observed_units"].nunique() == 1 else "Unbalanced"), counts
+
+
+def dataset_summary_sentence(df: pd.DataFrame, panel: pd.DataFrame | None, active_name: str) -> str:
+    provinces = df["prov_id"].nunique() if "prov_id" in df.columns else "no province id"
+    years = sorted(panel["year"].dropna().astype(int).unique()) if panel is not None and "year" in panel.columns else []
+    year_text = f"{min(years)}-{max(years)}" if years else "cross-sectional"
+    return (
+        f"{active_name} contains {len(df):,} observations across {provinces} provinces, "
+        f"covering {year_text} with {len(numeric_cols(df)):,} numeric variables available for analysis."
+    )
+
+
+def kpi_overview(df: pd.DataFrame, panel: pd.DataFrame | None):
+    years = sorted(panel["year"].dropna().astype(int).unique()) if panel is not None and "year" in panel.columns else []
+    balance, _ = panel_balance_status(panel)
+    cards = st.columns(6)
+    cards[0].metric("Observations", f"{len(df):,}")
+    cards[1].metric("Provinces", f"{df['prov_id'].nunique():,}" if "prov_id" in df.columns else "N/A")
+    cards[2].metric("Years", f"{len(years):,}" if years else "N/A")
+    cards[3].metric("Variables", f"{df.shape[1]:,}")
+    cards[4].metric("Numeric Variables", f"{len(numeric_cols(df)):,}")
+    cards[5].metric("Panel", balance)
+
+
+def outlier_summary(df: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
+    rows = []
+    for col in numeric_cols(df):
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(series) < 4:
+            continue
+        q1, q3 = series.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        if np.isclose(iqr, 0):
+            count = 0
+        else:
+            count = int(((series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)).sum())
+        rows.append({"variable": col, "outlier_share": count / len(series), "outliers": count})
+    if not rows:
+        return pd.DataFrame(columns=["variable", "outlier_share", "outliers"])
+    return pd.DataFrame(rows).sort_values("outlier_share", ascending=False).head(limit)
+
+
+def missing_summary(df: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
+    miss = df.isna().mean().sort_values(ascending=False).head(limit).reset_index()
+    miss.columns = ["variable", "missing_share"]
+    return miss[miss["missing_share"] > 0]
+
+
+def selected_panel_view(panel: pd.DataFrame | None, key_prefix: str) -> tuple[pd.DataFrame | None, str | None]:
+    if panel is None:
+        return None, None
+    panel_for_view = filter_panel_metric(panel, f"{key_prefix}_metric")
+    value_options = panel_value_options(panel_for_view)
+    if not value_options:
+        return panel_for_view, None
+    value = st.selectbox("Panel value", value_options, format_func=friendly, key=f"{key_prefix}_value")
+    return panel_for_view, value
 
 
 def data_catalog():
@@ -305,56 +473,188 @@ def data_catalog():
             st.dataframe(props.head(50), width="stretch", hide_index=True)
 
 
-def overview(df: pd.DataFrame, original: pd.DataFrame, panel: pd.DataFrame | None):
-    st.header("Overview & Data")
-    st.write(
-        f"**Active sample** - {len(df):,} rows, {df.shape[1]:,} columns after subsetting and outlier treatment."
-    )
-    metric_row(df)
+def overview(df: pd.DataFrame, original: pd.DataFrame, panel: pd.DataFrame | None, active_name: str):
+    st.header("Dataset Overview")
+    st.markdown("<p class='section-caption'>A compact research-data summary before moving into diagnostics and variable-level analysis.</p>", unsafe_allow_html=True)
+    kpi_overview(df, panel)
+    st.markdown(f"<div class='summary-box'>{dataset_summary_sentence(df, panel, active_name)}</div>", unsafe_allow_html=True)
 
-    with st.expander("Preview the analysis sample", expanded=False):
-        st.dataframe(df.head(80), width="stretch", height=360)
+    with st.expander("Preview analysis sample", expanded=False):
+        st.dataframe(df.head(80), width="stretch", height=340)
         download_frame(df, "Download filtered sample", "c3bolivia_filtered_sample.csv")
 
-    st.subheader("Panel balance & coverage")
-    if panel is not None:
-        coverage = panel.groupby("year")["prov_id" if "prov_id" in panel.columns else panel.columns[0]].nunique().reset_index(name="provinces")
-        fig = px.bar(coverage, x="year", y="provinces", title="Observed provinces by year")
-        st.plotly_chart(fig, width="stretch")
-        with st.expander("Balance summary"):
-            st.dataframe(coverage.describe().T, width="stretch")
+    st.markdown("<div class='dashboard-rule'></div>", unsafe_allow_html=True)
+    st.header("Data Quality")
+    st.markdown("<p class='section-caption'>Panel coverage, balance, missingness, and outlier checks are grouped here so the main analysis remains readable.</p>", unsafe_allow_html=True)
+    balance, coverage = panel_balance_status(panel)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Coverage & Balance")
+        if coverage is not None and not coverage.empty:
+            fig = px.bar(coverage, x="year", y="observed_units", title="Observed provinces by year", color_discrete_sequence=["#567568"])
+            st.plotly_chart(fig, width="stretch")
+            if balance != "Balanced":
+                st.markdown("<div class='warning-note'>Panel is unbalanced across years; inspect coverage before interpreting trends.</div>", unsafe_allow_html=True)
+        else:
+            dtype_summary = original.dtypes.astype(str).value_counts().reset_index()
+            dtype_summary.columns = ["dtype", "columns"]
+            fig = px.bar(dtype_summary, x="dtype", y="columns", title="Column types", color_discrete_sequence=["#567568"])
+            st.plotly_chart(fig, width="stretch")
+    with right:
+        st.subheader("Missing Data")
+        miss = missing_summary(df)
+        if miss.empty:
+            st.success("No missing values in the current filtered sample.")
+        else:
+            fig = px.bar(miss, x="missing_share", y="variable", orientation="h", title="Highest missing-value rates", color_discrete_sequence=["#b7791f"])
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Advanced diagnostics: outliers and balance table", expanded=False):
+        diag_left, diag_right = st.columns(2)
+        with diag_left:
+            outliers = outlier_summary(df)
+            if outliers.empty:
+                st.info("Outlier summary is not available for this sample.")
+            else:
+                fig = px.bar(outliers, x="outlier_share", y="variable", orientation="h", title="Largest IQR outlier shares", color_discrete_sequence=["#9f6b54"])
+                fig.update_layout(yaxis={"categoryorder": "total ascending"})
+                st.plotly_chart(fig, width="stretch")
+        with diag_right:
+            if coverage is not None and not coverage.empty:
+                st.dataframe(coverage.describe().T, width="stretch")
+            else:
+                st.dataframe(original.dtypes.astype(str).rename("dtype").reset_index().rename(columns={"index": "variable"}), width="stretch", hide_index=True)
+
+    st.markdown("<div class='dashboard-rule'></div>", unsafe_allow_html=True)
+    st.header("Variable Explorer")
+    st.markdown("<p class='section-caption'>Choose a variable first, then inspect summary statistics, distribution, trend, and the higher-load heatmap last.</p>", unsafe_allow_html=True)
+
+    panel_for_view, panel_value = selected_panel_view(panel, "explorer") if panel is not None else (None, None)
+    if panel_for_view is not None and panel_value is not None:
+        variable = panel_value
+        explorer_df = panel_for_view.copy()
     else:
-        dtype_summary = original.dtypes.astype(str).value_counts().reset_index()
-        dtype_summary.columns = ["dtype", "columns"]
-        fig = px.bar(dtype_summary, x="dtype", y="columns", title="Column types")
+        nums = numeric_cols(df)
+        if not nums:
+            st.info("No numeric variables available for exploration.")
+            return
+        variable = st.selectbox("Variable", nums, format_func=friendly, key="explorer_static_variable")
+        explorer_df = df.copy()
+
+    stat_col, dist_col = st.columns(2)
+    with stat_col:
+        st.subheader("Summary Statistics")
+        stats = pd.to_numeric(explorer_df[variable], errors="coerce").describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).to_frame("value")
+        st.dataframe(stats, width="stretch")
+    with dist_col:
+        st.subheader("Distribution")
+        fig = px.histogram(
+            explorer_df,
+            x=variable,
+            color="dep" if "dep" in explorer_df.columns else None,
+            nbins=28,
+            title=f"Distribution of {friendly(variable)}",
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
         st.plotly_chart(fig, width="stretch")
 
-    if panel is not None:
-        st.subheader("Value heatmap")
-        panel_for_heatmap = filter_panel_metric(panel, "overview_metric")
-        value_options = panel_value_options(panel_for_heatmap)
-        value = st.selectbox("Variable", value_options, format_func=friendly)
-        index_col = "dep" if "dep" in panel_for_heatmap.columns else "prov"
-        pivot = panel_for_heatmap.pivot_table(index=index_col, columns="year", values=value, aggfunc="mean")
-        fig = px.imshow(pivot, aspect="auto", color_continuous_scale="Viridis", title=f"{friendly(value)} by {index_col} and year")
-        st.plotly_chart(fig, width="stretch")
-
-    if geojson_path().exists() and "prov_id" in df.columns and numeric_cols(df):
-        with st.expander("Province map preview"):
+    trend_col, heatmap_col = st.columns(2)
+    with trend_col:
+        st.subheader("Time Trend")
+        if panel_for_view is not None and panel_value is not None and "year" in explorer_df.columns:
+            trend = explorer_df.groupby(["year", "dep"], as_index=False)[variable].mean() if "dep" in explorer_df.columns else explorer_df.groupby("year", as_index=False)[variable].mean()
+            fig = px.line(trend, x="year", y=variable, color="dep" if "dep" in trend.columns else None, markers=True, title=f"{friendly(variable)} over time")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            group = "dep" if "dep" in explorer_df.columns else None
+            if group:
+                grouped = explorer_df.groupby(group, as_index=False)[variable].mean()
+                fig = px.bar(grouped, x=group, y=variable, title=f"Mean {friendly(variable)} by department", color_discrete_sequence=["#567568"])
+                st.plotly_chart(fig, width="stretch")
+            else:
+                st.info("Time trend requires a panel dataset.")
+    with heatmap_col:
+        st.subheader("Heatmap")
+        if panel_for_view is not None and panel_value is not None and "year" in explorer_df.columns:
+            index_col = "dep" if "dep" in explorer_df.columns else "prov"
+            pivot = explorer_df.pivot_table(index=index_col, columns="year", values=variable, aggfunc="mean")
+            fig = px.imshow(pivot, aspect="auto", color_continuous_scale="Viridis", title=f"{friendly(variable)} by {index_col} and year")
+            st.plotly_chart(fig, width="stretch")
+        elif geojson_path().exists() and "prov_id" in explorer_df.columns:
             geo = json.loads(geojson_path().read_text())
-            color_col = st.selectbox("Map color", numeric_cols(df), index=0, format_func=friendly)
             fig = px.choropleth(
-                df,
+                explorer_df,
                 geojson=geo,
                 locations="prov_id",
                 featureidkey="properties.prov_id",
-                color=color_col,
-                hover_name="prov" if "prov" in df.columns else None,
+                color=variable,
+                hover_name=province_label_column(explorer_df),
                 color_continuous_scale="Viridis",
             )
             fig.update_geos(fitbounds="locations", visible=False)
-            fig.update_layout(title=f"{friendly(color_col)} by province", margin=dict(l=0, r=0, t=40, b=0))
+            fig.update_layout(title=f"{friendly(variable)} by province", margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Heatmap requires panel years or province geography.")
+
+
+def indicator_sample():
+    st.header("Indicator Sample")
+    panel = load_indicator_panel()
+    if panel.empty:
+        st.info("No annual indicator data found.")
+        return
+
+    if st.session_state.get("filter_dep") and "dep" in panel.columns:
+        panel = panel[panel["dep"].isin(st.session_state["filter_dep"])]
+    if st.session_state.get("filter_prov") and "prov" in panel.columns:
+        panel = panel[panel[province_label_column(panel)].isin(st.session_state["filter_prov"])]
+
+    c1, c2, c3 = st.columns([1.4, 1, 1])
+    indicators = sorted(panel["indicator"].dropna().unique())
+    indicator = c1.selectbox("Indicator", indicators)
+    indicator_panel = panel[panel["indicator"] == indicator].copy()
+    years = sorted(indicator_panel["year"].dropna().astype(int).unique())
+    year = c2.selectbox("Year", years, index=len(years) - 1)
+    mode = c3.selectbox("Sample mode", ["Top values", "Bottom values", "Random sample"])
+
+    year_df = indicator_panel[indicator_panel["year"] == year].dropna(subset=["value"]).copy()
+    max_n = max(int(len(year_df)), 1)
+    default_n = min(20, max_n)
+    sample_size = st.slider("Sample size", min_value=1, max_value=max_n, value=default_n)
+
+    if mode == "Top values":
+        sample = year_df.nlargest(sample_size, "value")
+    elif mode == "Bottom values":
+        sample = year_df.nsmallest(sample_size, "value")
+    else:
+        seed = st.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
+        sample = year_df.sample(n=sample_size, random_state=int(seed))
+
+    sample = sample.sort_values("value", ascending=True)
+    label_col = province_label_column(sample)
+    fig = px.bar(
+        sample,
+        x="value",
+        y=label_col,
+        color="dep" if "dep" in sample.columns else None,
+        orientation="h",
+        hover_data=[c for c in ["prov", "prov_id", "dep", "year"] if c in sample.columns and c != label_col],
+        title=f"{indicator}: {year} sample ({sample_size} of {max_n})",
+    )
+    fig.update_layout(yaxis_title="", xaxis_title=indicator)
+    st.plotly_chart(fig, width="stretch")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Available years", f"{min(years)}-{max(years)}")
+    c2.metric("Year sample", f"{len(year_df):,}")
+    c3.metric("Shown", f"{len(sample):,}")
+    c4.metric("Median", f"{year_df['value'].median():,.2f}")
+
+    with st.expander("Sample table"):
+        st.dataframe(sample.sort_values("value", ascending=False), width="stretch", hide_index=True)
+        download_frame(sample, "Download shown sample", f"c3bolivia_{indicator.lower().replace(' ', '_')}_{year}_sample.csv")
 
 
 def describe_variables(df: pd.DataFrame):
@@ -400,31 +700,6 @@ def within_between(df: pd.DataFrame, panel: pd.DataFrame | None):
         st.dataframe(agg, width="stretch")
 
 
-def trends(df: pd.DataFrame, panel: pd.DataFrame | None):
-    st.header("Trends")
-    if panel is None:
-        st.info("Trend view is available for datasets with a year column or annual metric columns.")
-        return
-    panel_for_view = filter_panel_metric(panel, "trends_metric")
-    value = st.selectbox("Trend variable", panel_value_options(panel_for_view), format_func=friendly)
-    by = st.radio("Aggregate by", ["Department mean", "Selected provinces"], horizontal=True)
-    if by == "Department mean" and "dep" in panel_for_view.columns:
-        trend = panel_for_view.groupby(["year", "dep"], as_index=False)[value].mean()
-        fig = px.line(trend, x="year", y=value, color="dep", markers=True, title=f"{friendly(value)} by department")
-    else:
-        provinces = sorted(panel_for_view["prov"].dropna().unique()) if "prov" in panel_for_view.columns else []
-        default = provinces[:6]
-        chosen = st.multiselect("Provinces", provinces, default=default)
-        trend = panel_for_view[panel_for_view["prov"].isin(chosen)] if chosen else panel_for_view.head(0)
-        fig = px.line(trend, x="year", y=value, color="prov", markers=True, title=f"{friendly(value)} for selected provinces")
-    st.plotly_chart(fig, width="stretch")
-
-    if {"prov", "year", value}.issubset(panel_for_view.columns):
-        latest_year = int(panel_for_view["year"].max())
-        latest = panel_for_view[panel_for_view["year"] == latest_year].nlargest(15, value)
-        st.plotly_chart(px.bar(latest, x=value, y="prov", color="dep" if "dep" in latest else None, orientation="h", title=f"Top provinces in {latest_year}"), width="stretch")
-
-
 def by_group(df: pd.DataFrame):
     st.header("By Group")
     cats = category_cols(df)
@@ -450,7 +725,7 @@ def composition(df: pd.DataFrame):
     size_options += [c for c in numeric_cols(df) if c not in size_options][:20]
     size = st.selectbox("Tile size", size_options, format_func=friendly)
     color = st.selectbox("Color", [c for c in ["imds", "population_2020", size] if c in df.columns] + [c for c in numeric_cols(df) if c not in [size]][:15], format_func=friendly)
-    path = ["dep", "prov"] if "prov" in df.columns else ["dep"]
+    path = ["dep", province_label_column(df)] if "prov" in df.columns else ["dep"]
     fig = px.treemap(df, path=path, values=size, color=color, color_continuous_scale="RdYlGn", title="Department/province composition")
     st.plotly_chart(fig, width="stretch")
 
@@ -475,7 +750,7 @@ def relationships(df: pd.DataFrame):
         y=y,
         color=color,
         size=None if size == "None" else size,
-        hover_name="prov" if "prov" in df.columns else None,
+        hover_name=province_label_column(df) if "prov" in df.columns or "prov_label" in df.columns else None,
         title=f"{friendly(y)} vs {friendly(x)}",
     )
     st.plotly_chart(fig, width="stretch")
@@ -491,19 +766,20 @@ def dynamics(df: pd.DataFrame, panel: pd.DataFrame | None):
     st.header("Dynamics")
     if panel is not None and {"year", "prov"}.issubset(panel.columns):
         panel_for_view = filter_panel_metric(panel, "dynamics_metric")
+        label_col = province_label_column(panel_for_view)
         value = st.selectbox("Dynamic variable", panel_value_options(panel_for_view), format_func=friendly)
         years = sorted(panel_for_view["year"].dropna().astype(int).unique())
         start, end = st.select_slider("Compare years", options=years, value=(years[0], years[-1]))
-        wide = panel_for_view[panel_for_view["year"].isin([start, end])].pivot_table(index=["prov", "dep"], columns="year", values=value).reset_index()
+        wide = panel_for_view[panel_for_view["year"].isin([start, end])].pivot_table(index=[label_col, "dep"], columns="year", values=value).reset_index()
         wide = wide.dropna(subset=[start, end])
         wide["change"] = wide[end] - wide[start]
         wide["pct_change"] = np.where(wide[start] != 0, wide["change"] / wide[start] * 100, np.nan)
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(px.scatter(wide, x=start, y=end, color="dep", hover_name="prov", title=f"{friendly(value)}: {start} vs {end}"), width="stretch")
+            st.plotly_chart(px.scatter(wide, x=start, y=end, color="dep", hover_name=label_col, title=f"{friendly(value)}: {start} vs {end}"), width="stretch")
         with c2:
             top = wide.reindex(wide["change"].abs().sort_values(ascending=False).index).head(20)
-            st.plotly_chart(px.bar(top, x="change", y="prov", color="dep", orientation="h", title="Largest absolute changes"), width="stretch")
+            st.plotly_chart(px.bar(top, x="change", y=label_col, color="dep", orientation="h", title="Largest absolute changes"), width="stretch")
         st.dataframe(wide.sort_values("pct_change", ascending=False), width="stretch")
         return
 
@@ -511,7 +787,7 @@ def dynamics(df: pd.DataFrame, panel: pd.DataFrame | None):
     if embed_cols:
         st.subheader("Satellite embedding projection")
         proj = pca_2d(df, embed_cols)
-        fig = px.scatter(proj, x="PC1", y="PC2", color="dep" if "dep" in proj.columns else None, hover_name="prov" if "prov" in proj.columns else None, size="imds" if "imds" in proj.columns else None)
+        fig = px.scatter(proj, x="PC1", y="PC2", color="dep" if "dep" in proj.columns else None, hover_name=province_label_column(proj) if "prov" in proj.columns or "prov_label" in proj.columns else None, size="imds" if "imds" in proj.columns else None)
         st.plotly_chart(fig, width="stretch")
     else:
         st.info("Dynamics view is available for panel data or embedding columns named A00-A63.")
@@ -537,23 +813,25 @@ def gdp_deep_dive():
     if st.session_state.get("filter_dep") and "dep" in gdp.columns:
         gdp = gdp[gdp["dep"].isin(st.session_state["filter_dep"])]
     if st.session_state.get("filter_prov") and "prov" in gdp.columns:
-        gdp = gdp[gdp["prov"].isin(st.session_state["filter_prov"])]
+        gdp = gdp[gdp[province_label_column(gdp)].isin(st.session_state["filter_prov"])]
 
     years = sorted(gdp["year"].dropna().astype(int).unique())
     start, end = st.select_slider("GDP analysis period", options=years, value=(years[0], years[-1]))
     gdp = gdp[(gdp["year"] >= start) & (gdp["year"] <= end)].copy()
     gdp["gdppc"] = pd.to_numeric(gdp["gdppc"], errors="coerce")
     gdp["log_gdppc"] = np.log(gdp["gdppc"].where(gdp["gdppc"] > 0))
+    label_col = province_label_column(gdp)
 
     latest_year = int(gdp["year"].max())
     first_year = int(gdp["year"].min())
     latest = gdp[gdp["year"] == latest_year].copy()
     first = gdp[gdp["year"] == first_year].copy()
-    merged = first[["prov_id", "prov", "dep", "gdppc"]].merge(
+    merged = first[[c for c in ["prov_id", "prov", "prov_label", "dep", "gdppc"] if c in first.columns]].merge(
         latest[["prov_id", "gdppc"]],
         on="prov_id",
         suffixes=("_start", "_end"),
     )
+    merged_label_col = province_label_column(merged)
     merged["change"] = merged["gdppc_end"] - merged["gdppc_start"]
     merged["pct_change"] = np.where(merged["gdppc_start"] > 0, merged["change"] / merged["gdppc_start"] * 100, np.nan)
     years_elapsed = max(latest_year - first_year, 1)
@@ -577,7 +855,7 @@ def gdp_deep_dive():
         fig = px.bar(
             top_growth,
             x="cagr",
-            y="prov",
+            y=merged_label_col,
             color="dep",
             orientation="h",
             title=f"Fastest annual growth, {first_year}-{latest_year}",
@@ -589,7 +867,7 @@ def gdp_deep_dive():
         fig = px.bar(
             bottom_growth,
             x="cagr",
-            y="prov",
+            y=merged_label_col,
             color="dep",
             orientation="h",
             title=f"Slowest annual growth, {first_year}-{latest_year}",
@@ -601,22 +879,27 @@ def gdp_deep_dive():
     ranks = gdp.copy()
     ranks["rank"] = ranks.groupby("year")["gdppc"].rank(ascending=False, method="min")
     rank_wide = ranks[ranks["year"].isin([first_year, latest_year])].pivot_table(
-        index=["prov_id", "prov", "dep"], columns="year", values="rank"
+        index=unique_existing(["prov_id", label_col, "prov", "dep"], ranks),
+        columns="year",
+        values="rank",
     ).reset_index()
     rank_wide["rank_change"] = rank_wide[first_year] - rank_wide[latest_year]
     movers = rank_wide.reindex(rank_wide["rank_change"].abs().sort_values(ascending=False).index).head(top_n)
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.bar(movers, x="rank_change", y="prov", color="dep", orientation="h", title="Largest rank moves")
+        rank_label_col = province_label_column(movers)
+        fig = px.bar(movers, x="rank_change", y=rank_label_col, color="dep", orientation="h", title="Largest rank moves")
         st.plotly_chart(fig, width="stretch")
     with c2:
+        track_label_col = province_label_column(gdp)
+        rank_options = sorted(gdp[track_label_col].dropna().unique())
         chosen = st.multiselect(
             "Track province ranks",
-            sorted(gdp["prov"].dropna().unique()),
-            default=sorted(gdp["prov"].dropna().unique())[:6],
+            rank_options,
+            default=rank_options[:6],
         )
-        rank_lines = ranks[ranks["prov"].isin(chosen)] if chosen else ranks.head(0)
-        fig = px.line(rank_lines, x="year", y="rank", color="prov", markers=True, title="GDPpc rank over time")
+        rank_lines = ranks[ranks[track_label_col].isin(chosen)] if chosen else ranks.head(0)
+        fig = px.line(rank_lines, x="year", y="rank", color=track_label_col, markers=True, title="GDPpc rank over time")
         fig.update_yaxes(autorange="reversed")
         st.plotly_chart(fig, width="stretch")
 
@@ -644,7 +927,7 @@ def gdp_deep_dive():
         st.plotly_chart(fig, width="stretch")
 
     st.subheader("Convergence")
-    conv = first[["prov_id", "prov", "dep", "gdppc"]].merge(
+    conv = first[[c for c in ["prov_id", "prov", "prov_label", "dep", "gdppc"] if c in first.columns]].merge(
         merged[["prov_id", "cagr"]],
         on="prov_id",
     )
@@ -653,7 +936,7 @@ def gdp_deep_dive():
         x="gdppc",
         y="cagr",
         color="dep",
-        hover_name="prov",
+        hover_name=province_label_column(conv),
         trendline=None,
         title=f"Initial GDPpc vs subsequent annual growth ({first_year}-{latest_year})",
     )
@@ -689,8 +972,8 @@ df.head()
 
 
 with st.sidebar:
-    st.title("ExPdPy")
-    st.subheader("Data")
+    st.title("Data Setup")
+    st.subheader("Dataset")
     st.info(
         "Private/local mode: this app reads CSV files from your local repository only. "
         "Do not deploy or push private data to a public hosting service.",
@@ -699,19 +982,22 @@ with st.sidebar:
     active_name = DEFAULT_DATASETS[dataset_label]
     raw = load_dataset(active_name)
 
-    st.caption(f"**Active sample** - {active_name}")
+    st.caption(f"Active local file: `{active_name}`")
 
     years = infer_years(raw)
     if "year" in raw.columns and years:
-        st.subheader("Sample")
+        st.subheader("Temporal Sample")
         st.slider("Period", min_value=min(years), max_value=max(years), value=(min(years), max(years)), key="year_range")
         st.caption("Drag the handles together for a single-year cross-section.")
 
+    st.subheader("Geographic Filters")
     if "dep" in raw.columns:
         st.multiselect("Filter by category", sorted(raw["dep"].dropna().unique()), key="filter_dep", placeholder="Choose departments")
-    if "prov" in raw.columns:
-        st.multiselect("Filter by province", sorted(raw["prov"].dropna().unique()), key="filter_prov", placeholder="Choose provinces")
+    province_filter_col = province_label_column(raw)
+    if province_filter_col in raw.columns:
+        st.multiselect("Filter by province", sorted(raw[province_filter_col].dropna().unique()), key="filter_prov", placeholder="Choose provinces")
 
+    st.subheader("Preprocessing")
     nums_for_range = numeric_cols(raw)
     range_col = st.selectbox("Filter by range", ["None"] + nums_for_range, format_func=friendly)
     range_values = None
@@ -723,7 +1009,7 @@ with st.sidebar:
 
     outlier_mode = st.selectbox("Outlier treatment", ["None", "Winsorize 1%-99%", "Winsorize 5%-95%"])
 
-    with st.expander("Advanced: user-defined variables"):
+    with st.expander("Advanced options"):
         st.caption("Create one ratio from two numeric columns.")
         ratio_name = st.text_input("New variable name", value="")
         numerator = st.selectbox("Numerator", ["None"] + nums_for_range, format_func=friendly)
@@ -749,15 +1035,21 @@ with st.sidebar:
 df = apply_filters(raw, None if range_col == "None" else range_col, range_values, outlier_mode)
 panel = make_panel(df)
 
-st.sidebar.subheader("Overview")
-page = st.sidebar.radio(
-    "Explore",
+st.title("C3 Bolivia")
+st.caption("Research-data workbench for province-level SDG, satellite, population, night lights, and GDP per capita data.")
+
+overview(df, raw, panel, active_name)
+
+st.markdown("<div class='dashboard-rule'></div>", unsafe_allow_html=True)
+st.header("Analysis")
+st.markdown("<p class='section-caption'>Use the focused modules below after reviewing setup, overview, quality, and variables.</p>", unsafe_allow_html=True)
+analysis_page = st.selectbox(
+    "Analysis module",
     [
-        "Overview & Data",
         "Data catalog",
+        "Indicator sample",
         "Describe variables",
         "Within & between",
-        "Trends",
         "By group",
         "Composition",
         "Relationships",
@@ -766,26 +1058,21 @@ page = st.sidebar.radio(
     ],
 )
 
-st.title("C3 Bolivia")
-st.caption("Local-only exploration of province-level SDG, satellite, population, night lights, and GDP per capita data.")
-
-if page == "Overview & Data":
-    overview(df, raw, panel)
-elif page == "Data catalog":
+if analysis_page == "Data catalog":
     data_catalog()
-elif page == "Describe variables":
+elif analysis_page == "Indicator sample":
+    indicator_sample()
+elif analysis_page == "Describe variables":
     describe_variables(df)
-elif page == "Within & between":
+elif analysis_page == "Within & between":
     within_between(df, panel)
-elif page == "Trends":
-    trends(df, panel)
-elif page == "By group":
+elif analysis_page == "By group":
     by_group(df)
-elif page == "Composition":
+elif analysis_page == "Composition":
     composition(df)
-elif page == "Relationships":
+elif analysis_page == "Relationships":
     relationships(df)
-elif page == "Dynamics":
+elif analysis_page == "Dynamics":
     dynamics(df, panel)
-elif page == "GDP per capita deep dive":
+elif analysis_page == "GDP per capita deep dive":
     gdp_deep_dive()
