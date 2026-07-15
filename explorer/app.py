@@ -1367,14 +1367,23 @@ def kuznets_waves():
     )
     st.plotly_chart(fig, width="stretch")
 
-    st.subheader("Province-level spatial gap curve")
+    st.subheader("Province-level spatial gap diagnostic")
     st.markdown(
-        "<p class='section-caption'>Each point is a province-year. The y-axis is the absolute log GDPpc gap between the province and its department-year mean, so this view asks whether richer provinces sit closer to, or farther from, their local department average.</p>",
+        "<p class='section-caption'>Each point is a province-year. The y-axis is the absolute log GDPpc gap between the province and its department-year mean. This is a province-level spatial-gap diagnostic, not the standard Kuznets inequality outcome; the Kuznets-consistent y-axis is the department-year province GDPpc Gini in the chart above.</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class='warning-note'>
+        <strong>Why not use Gini here?</strong><br>
+        A Gini coefficient requires a distribution across multiple units. A single province-year is one observation, so it does not have an internal distribution from which a province-level Gini can be computed. For a Kuznets-consistent inequality outcome, the dashboard therefore uses the department-year Gini across provinces in the chart above. The province-year chart below instead uses the absolute log GDPpc gap from the department-year mean, which should be read as a spatial-gap diagnostic rather than a formal Kuznets inequality curve.
+        </div>
+        """,
         unsafe_allow_html=True,
     )
     province_panel = build_province_kuznets_panel(gdp)
     if len(province_panel) < degree + 5 or province_panel["province_unit"].nunique() < 2:
-        st.info("Not enough province-year observations for a province-level Kuznets curve after filtering.")
+        st.info("Not enough province-year observations for a province-level spatial-gap diagnostic after filtering.")
     else:
         province_models = [
             fit_kuznets_model(
@@ -1394,7 +1403,7 @@ def kuznets_waves():
             y_col="province_gap",
             color_col="dep",
             hover_cols=["province_name", "dep", "year", "gdppc", "signed_gap"],
-            title="Province-level Kuznets curve: GDPpc gap vs province development",
+            title="Province-level spatial gap: GDPpc gap vs province development",
             x_title="log(province GDP per capita), province-year",
             y_title="Absolute log gap from department-year mean",
             hovertemplate=(
@@ -1443,7 +1452,7 @@ def kuznets_waves():
                 width="stretch",
                 hide_index=True,
             )
-            download_frame(province_panel, "Download province-level Kuznets panel", "c3bolivia_kuznets_province_panel.csv")
+            download_frame(province_panel, "Download province-level spatial-gap panel", "c3bolivia_province_spatial_gap_panel.csv")
 
     coef_rows = []
     turning_rows = []
